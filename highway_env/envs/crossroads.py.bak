@@ -1,0 +1,1127 @@
+from __future__ import division, print_function, absolute_import
+import numpy as np
+
+from highway_env import utils
+from highway_env.envs.abstract import AbstractEnv
+from highway_env.road.lane import LineType, StraightLane, SineLane, CircularLane
+from highway_env.road.road import Road, RoadNetwork
+from highway_env.vehicle.control import ControlledVehicle, MDPVehicle, CarSim, FreeControl
+from highway_env.vehicle.behavior import IDMVehicle
+from highway_env.vehicle.dynamics import RedLight
+import pygame
+import random
+import math
+from highway_env.envs.graphics import EnvViewer
+
+
+def rad(deg):
+    return deg * np.pi / 180
+
+
+class CrossroadEnv(AbstractEnv):
+    """
+        A highway merge negotiation environment.
+
+        The ego-vehicle is driving on a highway and approached a merge, with some vehicles incoming on the access ramp.
+        It is rewarded for maintaining a high velocity and avoiding collisions, but also making room for merging
+        vehicles.
+    """
+
+    COLLISION_REWARD = -1
+    RIGHT_LANE_REWARD = 0.1
+    HIGH_VELOCITY_REWARD = 0.2
+    MERGING_VELOCITY_REWARD = -0.5
+    LANE_CHANGE_REWARD = -0.05
+
+    DEFAULT_CONFIG = {"other_vehicles_type": "highway_env.vehicle.behavior.IDMVehicle",
+                      "incoming_vehicle_destination": None,
+                      "other_vehicles_destination": None}
+
+    def __init__(self):
+        super(CrossroadEnv, self).__init__()
+        self.config = self.DEFAULT_CONFIG.copy()
+        self.steps = 0
+        self.traffic_lights = {}
+        self.have_traffic_lights = False
+        self.entrance = ["swwe", "swse", "wmwe", "wmee", "nwwe", "nwne", "nene", "neee", "emwe", "emee", "sese", "seee"]
+        self.end = ["swwx", "swsx", "wmwx", "nwwx", "nwnx", "nenx",
+                    "neex",
+                    "emex",
+                    "seex", "sesx"]
+        EnvViewer.SCREEN_HEIGHT = 1000
+        EnvViewer.SCREEN_WIDTH = 1000
+
+    def configure(self, config):
+        self.config.update(config)
+
+    def _observation(self):
+        return super(CrossroadEnv, self)._observation()
+
+    def _reward(self, action):
+        """
+            The vehicle is rewarded for driving with high velocity on lanes to the right and avoiding collisions, but
+            an additional altruistic penalty is also suffered if any vehicle on the merging lane has a low velocity.
+        :param action: the action performed
+        :return: the reward of the state-action transition
+        """
+        action_reward = {0: self.LANE_CHANGE_REWARD,
+                         1: 0,
+                         2: self.LANE_CHANGE_REWARD,
+                         3: 0,
+                         4: 0}
+        reward = self.COLLISION_REWARD * self.vehicle.crashed \
+                 + self.RIGHT_LANE_REWARD * self.vehicle.lane_index / (len(self.road.lanes) - 2) \
+                 + self.HIGH_VELOCITY_REWARD * self.vehicle.velocity_index / (self.vehicle.SPEED_COUNT - 1)
+
+        # Altruistic penalty
+        for vehicle in self.road.vehicles:
+            if vehicle.lane_index == len(self.road.lanes) - 1 and isinstance(vehicle, ControlledVehicle):
+                reward += self.MERGING_VELOCITY_REWARD * \
+                          (vehicle.target_velocity - vehicle.velocity) / vehicle.target_velocity
+        return reward + action_reward[action]
+
+    def _is_terminal(self):
+        """
+            The episode is over when a collision occurs or when the access ramp has been passed.
+        """
+        return self.vehicle.crashed or self.vehicle.position[0] > 300
+
+    def reset(self):
+        self.make_roads()
+        self.make_vehicles()
+        return self._observation()
+
+    def make_roads(self):
+        net = RoadNetwork()
+        n, c, s = LineType.NONE, LineType.CONTINUOUS, LineType.STRIPED
+        """
+        crossroad of southwest
+        sw:southwest
+        w:west n:north e:east s:south
+        e:entrance x:exit
+        r:right of the ego_car  l:left of the ego_car
+
+
+                                   swne swnx
+                                    inter4
+                            swner swnel swnxl swnxr
+        swwe         swwxr                          sweer          swee
+        swwx  inter1 swnxl                          sweel  inter3  swex
+                     swnel                          swexl
+                     swner                          swexr
+                            swsxr swsxl swsel swser
+                                    inter2
+                                   swsx swse
+        """
+
+        net.add_lane("swwe", "intersw1", StraightLane(np.array([0, 0]), np.array([25, 0]), line_types=[c, s]))
+        net.add_lane("intersw1", "swwel",
+                     StraightLane(np.array([25, 0]), np.array([50, 0]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("swwe", "intersw1", StraightLane(np.array([0, 4]), np.array([25, 4]), line_types=[s, c]))
+        net.add_lane("intersw1", "swwer",
+                     StraightLane(np.array([25, 4]), np.array([50, 4]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("inter_sw_1", "swwx", StraightLane(np.array([25, -8]), np.array([0, -8]), line_types=[s, c]))
+        net.add_lane("swwxr", "inter_sw_1", StraightLane(np.array([50, -8]), np.array([25, -8]), line_types=[s, c]))
+
+        net.add_lane("inter_sw_1", "swwx", StraightLane(np.array([25, -4]), np.array([0, -4]), line_types=[c, s]))
+        net.add_lane("swwxl", "inter_sw_1", StraightLane(np.array([50, -4]), np.array([25, -4]), line_types=[c, s]))
+
+        net.add_lane("swse", "intersw2", StraightLane(np.array([62, 58]), np.array([62, 33]), line_types=[c, s]))
+        net.add_lane("intersw2", "swsel",
+                     StraightLane(np.array([62, 33]), np.array([62, 8]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("swse", "intersw2", StraightLane(np.array([66, 58]), np.array([66, 33]), line_types=[s, c]))
+        net.add_lane("intersw2", "swser",
+                     StraightLane(np.array([66, 33]), np.array([66, 8]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("inter_sw_2", "swsx", StraightLane(np.array([54, 33]), np.array([54, 58]), line_types=[s, c]))
+        net.add_lane("swsxr", "inter_sw_2", StraightLane(np.array([54, 8]), np.array([54, 33]), line_types=[s, c]))
+
+        net.add_lane("inter_sw_2", "swsx", StraightLane(np.array([58, 33]), np.array([58, 58]), line_types=[c, s]))
+        net.add_lane("swsxl", "inter_sw_2", StraightLane(np.array([58, 8]), np.array([58, 33]), line_types=[c, s]))
+
+        # net.add_lane("swee", "intersw3", StraightLane(np.array([328, -8]), np.array([228, -8]), line_types=[s, c]))
+        net.add_lane("intersw3", "sweer",
+                     StraightLane(np.array([95, -8]), np.array([70, -8]), line_types=[c, c], forbidden=True))
+
+        # net.add_lane("swee", "intersw3", StraightLane(np.array([328, -4]), np.array([228, -4]), line_types=[c, s]))
+        net.add_lane("intersw3", "sweel",
+                     StraightLane(np.array([95, -4]), np.array([70, -4]), line_types=[c, c], forbidden=True))
+
+        # net.add_lane("intersw_3", "swex", StraightLane(np.array([228, 0]), np.array([328, 0]), line_types=[c, s]))
+        net.add_lane("swexl", "inter_sw_3", StraightLane(np.array([70, 0]), np.array([95, 0]), line_types=[c, s]))
+
+        # net.add_lane("intersw_3", "swex", StraightLane(np.array([228, 4]), np.array([328, 4]), line_types=[s, c]))
+        net.add_lane("swexr", "inter_sw_3", StraightLane(np.array([70, 4]), np.array([95, 4]), line_types=[s, c]))
+
+        net.add_lane("intersw4", "swner",
+                     StraightLane(np.array([54, -37]), np.array([54, -12]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("intersw4", "swnel",
+                     StraightLane(np.array([58, -37]), np.array([58, -12]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("swnxl", "inter_sw_4", StraightLane(np.array([62, -12]), np.array([62, -37]), line_types=[c, s]))
+
+        net.add_lane("swnxr", "inter_sw_4", StraightLane(np.array([66, -12]), np.array([66, -37]), line_types=[s, c]))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        # center = [152, 10]
+        # radii = [6, 10]
+        # alpha = math.degrees(math.asin(math.sqrt(97) / radii[0] / 2))
+        net.add_lane("swwer", "swsxr",
+                     StraightLane(np.array([50, 4]), np.array([54, 8]), line_types=[n, n], forbidden=True))
+        # center = [152, -13]
+        net.add_lane("swner", "swwxr",
+                     StraightLane(np.array([54, -12]), np.array([50, -8]), line_types=[n, n], forbidden=True))
+        net.add_lane("swnel", "swsxl",
+                     StraightLane(np.array([58, -12]), np.array([58, 8]), line_types=[n, n], forbidden=True))
+        net.add_lane("swnel", "swexl",
+                     StraightLane(np.array([58, -12]), np.array([70, 0]), line_types=[n, n], forbidden=True))
+
+        # center = [178, -13]
+        net.add_lane("sweer", "swnxr",
+                     StraightLane(np.array([70, -8]), np.array([66, -12]), line_types=[n, n], forbidden=True))
+        net.add_lane("sweel", "swsxl",
+                     StraightLane(np.array([70, -4]), np.array([58, 8]), line_types=[n, n], forbidden=True))
+        net.add_lane("sweel", "swwxl",
+                     StraightLane(np.array([70, -4]), np.array([50, -4]), line_types=[n, n], forbidden=True))
+
+        # center = [178, 10]
+        net.add_lane("swser", "swexr",
+                     StraightLane(np.array([66, 8]), np.array([70, 4]), line_types=[n, n], forbidden=True))
+        net.add_lane("swsel", "swwxl",
+                     StraightLane(np.array([62, 8]), np.array([50, -4]), line_types=[n, n], forbidden=True))
+        net.add_lane("swsel", "swnxl",
+                     StraightLane(np.array([62, 8]), np.array([62, -12]), line_types=[n, n], forbidden=True))
+        net.add_lane("swwel", "swnxl",
+                     StraightLane(np.array([50, 0]), np.array([62, -12]), line_types=[n, n], forbidden=True))
+        net.add_lane("swwel", "swexl",
+                     StraightLane(np.array([50, 0]), np.array([70, 0]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of west
+        m:middle
+        """
+        net.add_lane("inter_sw_4", "interwm2",
+                     StraightLane(np.array([62, -37]), np.array([62, -62]), line_types=[c, s]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([66, -37]), np.array([66, -42]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([66, -42]), np.array([62, -49]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([62, -62]), np.array([66, -67]), line_types=[n, c]))
+        # net.add_lane("intersw_mergein", "interwm_mergeout",
+        #              StraightLane(np.array([62, -47]), np.array([62, -55]), line_types=[c, c]))
+        net.add_lane("inter_wm_2", "intersw4",
+                     StraightLane(np.array([58, -62]), np.array([58, -37]), line_types=[c, c]))
+
+        # net.add_lane("interwm_mergeout", "interwm2l",
+        #              StraightLane(np.array([62, -55]), np.array([62, -62]), line_types=[c, s]))
+        # net.add_lane("interwm_mergeout", "interwm2r",
+        #              StraightLane(np.array([62, -55]), np.array([66, -62]), line_types=[n, c]))
+        net.add_lane("interwm2", "wmsel",
+                     StraightLane(np.array([62, -62]), np.array([62, -87]), line_types=[c, c], forbidden=True))
+        net.add_lane("interwm2", "wmser",
+                     StraightLane(np.array([66, -62]), np.array([66, -87]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("wmsxr", "inter_wm_2",
+                     StraightLane(np.array([54, -87]), np.array([54, -62]), line_types=[s, c]))
+        net.add_lane("wmsxl", "inter_wm_2",
+                     StraightLane(np.array([58, -87]), np.array([58, -62]), line_types=[c, s]))
+
+        net.add_lane("wmwe", "interwm1", StraightLane(np.array([0, -99]), np.array([25, -99]), line_types=[c, s]))
+        net.add_lane("wmwe", "interwm1", StraightLane(np.array([0, -95]), np.array([25, -95]), line_types=[s, c]))
+
+        net.add_lane("interwm1", "wmwel",
+                     StraightLane(np.array([25, -99]), np.array([50, -99]), line_types=[c, c], forbidden=True))
+        net.add_lane("interwm1", "wmwer",
+                     StraightLane(np.array([25, -95]), np.array([50, -95]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("inter_wm_1", "wmwx", StraightLane(np.array([25, -103]), np.array([0, -103]), line_types=[c, s]))
+        net.add_lane("inter_wm_1", "wmwx", StraightLane(np.array([25, -107]), np.array([0, -107]), line_types=[s, c]))
+
+        net.add_lane("wmwxl", "inter_wm_1",
+                     StraightLane(np.array([50, -103]), np.array([25, -103]), line_types=[c, s]))
+        net.add_lane("wmwxr", "inter_wm_1",
+                     StraightLane(np.array([50, -107]), np.array([25, -107]), line_types=[s, c]))
+
+        net.add_lane("wmee", "interwm3",
+                     StraightLane(np.array([120, -107]), np.array([95, -107]), line_types=[s, c]))
+        net.add_lane("wmee", "interwm3",
+                     StraightLane(np.array([120, -103]), np.array([95, -103]), line_types=[c, s]))
+        net.add_lane("interwm3", "wmeer",
+                     StraightLane(np.array([95, -107]), np.array([70, -107]), line_types=[c, c], forbidden=True))
+        net.add_lane("interwm3", "wmeel",
+                     StraightLane(np.array([95, -103]), np.array([70, -103]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("wmexr", "inter_wm_3",
+                     StraightLane(np.array([70, -95]), np.array([95, -95]), line_types=[s, c]))
+        net.add_lane("wmexl", "inter_wm_3",
+                     StraightLane(np.array([70, -99]), np.array([95, -99]), line_types=[c, s]))
+        net.add_lane("inter_wm_3", "wmex",
+                     StraightLane(np.array([95, -95]), np.array([120, -95]), line_types=[s, c]))
+        net.add_lane("inter_wm_3", "wmex",
+                     StraightLane(np.array([95, -99]), np.array([120, -99]), line_types=[c, s]))
+
+        net.add_lane("interwm4", "wmner",
+                     StraightLane(np.array([54, -136]), np.array([54, -111]), line_types=[c, c], forbidden=True))
+        net.add_lane("interwm4", "wmnel",
+                     StraightLane(np.array([58, -136]), np.array([58, -111]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("wmnxr", "inter_wm_4",
+                     StraightLane(np.array([66, -111]), np.array([66, -136]), line_types=[s, c]))
+        net.add_lane("wmnxl", "inter_wm_4",
+                     StraightLane(np.array([62, -111]), np.array([62, -136]), line_types=[c, s]))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        # center = [152, -210]
+        # radii = [6, 10]
+        # alpha = math.degrees(math.asin(math.sqrt(97) / radii[0] / 2))
+        net.add_lane("wmwer", "wmsxr",
+                     StraightLane(np.array([50, -95]), np.array([54, -87]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmwel", "wmnxl",
+                     StraightLane(np.array([50, -99]), np.array([62, -111]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmwel", "wmexl",
+                     StraightLane(np.array([50, -99]), np.array([70, -99]), line_types=[n, n], forbidden=True))
+
+        # center = [152, -233]
+        net.add_lane("wmner", "wmwxr",
+                     StraightLane(np.array([54, -111]), np.array([50, -107]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmnel", "wmexl",
+                     StraightLane(np.array([58, -111]), np.array([70, -99]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmnel", "wmsxl",
+                     StraightLane(np.array([58, -111]), np.array([58, -87]), line_types=[n, n], forbidden=True))
+
+        # center = [178, -233]
+        net.add_lane("wmeer", "wmnxr",
+                     StraightLane(np.array([70, -107]), np.array([66, -111]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmeel", "wmsxl",
+                     StraightLane(np.array([70, -103]), np.array([58, -87]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmeel", "wmwxl",
+                     StraightLane(np.array([70, -103]), np.array([50, -103]), line_types=[n, n], forbidden=True))
+
+        # center = [178, -210]
+        net.add_lane("wmser", "wmexr",
+                     StraightLane(np.array([66, -87]), np.array([70, -95]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmsel", "wmnxl",
+                     StraightLane(np.array([62, -87]), np.array([62, -111]), line_types=[n, n], forbidden=True))
+        net.add_lane("wmsel", "wmwxl",
+                     StraightLane(np.array([62, -87]), np.array([50, -103]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of west
+        m:middle
+        """
+        net.add_lane("inter_wm_4", "internw2",
+                     StraightLane(np.array([62, -136]), np.array([62, -161]), line_types=[c, s]))
+        net.add_lane("inter_nw_2", "interwm4",
+                     StraightLane(np.array([58, -161]), np.array([58, -136]), line_types=[c, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([66, -136]), np.array([62, -146]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([62, -161]), np.array([66, -165]), line_types=[n, c]))
+
+        net.add_lane("internw2", "nwsel",
+                     StraightLane(np.array([62, -161]), np.array([62, -186]), line_types=[c, c], forbidden=True))
+        net.add_lane("internw2", "nwser",
+                     StraightLane(np.array([66, -161]), np.array([66, -186]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("nwsxr", "inter_nw_2",
+                     StraightLane(np.array([54, -186]), np.array([54, -161]), line_types=[s, c]))
+        net.add_lane("nwsxl", "inter_nw_2",
+                     StraightLane(np.array([58, -186]), np.array([58, -161]), line_types=[c, s]))
+
+        net.add_lane("nwwe", "internw1", StraightLane(np.array([0, -194]), np.array([25, -194]), line_types=[s, c]))
+        net.add_lane("nwwe", "internw1", StraightLane(np.array([0, -198]), np.array([25, -198]), line_types=[c, s]))
+
+        net.add_lane("internw1", "nwwel",
+                     StraightLane(np.array([25, -198]), np.array([50, -198]), line_types=[c, c], forbidden=True))
+        net.add_lane("internw1", "nwwer",
+                     StraightLane(np.array([25, -194]), np.array([50, -194]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("inter_nw_1", "nwwx", StraightLane(np.array([25, -202]), np.array([0, -202]), line_types=[c, s]))
+        net.add_lane("inter_nw_1", "nwwx", StraightLane(np.array([25, -206]), np.array([0, -206]), line_types=[s, c]))
+
+        net.add_lane("nwwxl", "inter_nw_1",
+                     StraightLane(np.array([50, -202]), np.array([25, -202]), line_types=[c, s]))
+        net.add_lane("nwwxr", "inter_nw_1",
+                     StraightLane(np.array([50, -206]), np.array([25, -206]), line_types=[s, c]))
+
+        net.add_lane("internw3", "nweer",
+                     StraightLane(np.array([99, -210]), np.array([74, -210]), line_types=[c, c], forbidden=True))
+        net.add_lane("internw3", "nweel",
+                     StraightLane(np.array([99, -206]), np.array([74, -206]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("nwexr", "inter_nw_3",
+                     StraightLane(np.array([74, -190]), np.array([99, -190]), line_types=[s, c]))
+        net.add_lane("nwexl", "inter_nw_3",
+                     StraightLane(np.array([74, -202]), np.array([99, -202]), line_types=[c, s]))
+        net.add_lane("nwexmr", "inter_nw_3",
+                     StraightLane(np.array([74, -194]), np.array([99, -194]), line_types=[s, s]))
+        net.add_lane("nwexml", "inter_nw_3",
+                     StraightLane(np.array([74, -198]), np.array([99, -198]), line_types=[s, s]))
+
+        net.add_lane("nwne", "internw4",
+                     StraightLane(np.array([54, -261]), np.array([54, -239]), line_types=[s, c]))
+        net.add_lane("nwne", "internw4",
+                     StraightLane(np.array([58, -261]), np.array([58, -239]), line_types=[c, s]))
+        net.add_lane("internw4", "nwner",
+                     StraightLane(np.array([54, -239]), np.array([54, -214]), line_types=[c, c], forbidden=True))
+        net.add_lane("internw4", "nwnel",
+                     StraightLane(np.array([58, -239]), np.array([58, -214]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("nwnxr", "inter_nw_4",
+                     StraightLane(np.array([66, -214]), np.array([66, -239]), line_types=[s, c]))
+        net.add_lane("nwnxl", "inter_nw_4",
+                     StraightLane(np.array([62, -214]), np.array([62, -239]), line_types=[c, s]))
+        net.add_lane("inter_nw_4", "nwnx",
+                     StraightLane(np.array([66, -239]), np.array([66, -264]), line_types=[s, c]))
+        net.add_lane("inter_nw_4", "nwnx",
+                     StraightLane(np.array([62, -239]), np.array([62, -264]), line_types=[c, s]))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        net.add_lane("nwner", "nwwxr",
+                     StraightLane(np.array([54, -214]), np.array([50, -206]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("nwwer", "nwsxr",
+                     StraightLane(np.array([50, -194]), np.array([54, -186]), line_types=[n, n], forbidden=True))
+        net.add_lane("nwwel", "nwnxl",
+                     StraightLane(np.array([50, -198]), np.array([62, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("nwwel", "nwexmr",
+                     StraightLane(np.array([50, -198]), np.array([74, -194]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("nweer", "nwnxr",
+                     StraightLane(np.array([74, -210]), np.array([66, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("nweel", "nwsxl",
+                     StraightLane(np.array([74, -206]), np.array([58, -186]), line_types=[n, n], forbidden=True))
+        net.add_lane("nweel", "nwwxl",
+                     StraightLane(np.array([74, -206]), np.array([50, -202]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("nwser", "nwexr",
+                     StraightLane(np.array([66, -186]), np.array([74, -190]), line_types=[n, n], forbidden=True))
+        net.add_lane("nwsel", "nwwxl",
+                     StraightLane(np.array([62, -186]), np.array([50, -202]), line_types=[n, n], forbidden=True))
+        net.add_lane("nwsel", "nwnxl",
+                     StraightLane(np.array([62, -186]), np.array([62, -214]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("nwnel", "nwexl",
+                     StraightLane(np.array([58, -214]), np.array([74, -202]), line_types=[n, n], forbidden=True))
+        net.add_lane("nwnel", "nwsxl",
+                     StraightLane(np.array([58, -214]), np.array([58, -186]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of north
+        internw3                         <-----                         interne_1
+        internw3                                                        interne_1
+
+                                         ----->
+        internw_3       internm1        internm2        internm3        interne1
+        internw_3       internm1        internm2        internm3        interne1
+        internw_3       internm1        internm2        internm3        interne1
+        internw_3       internm1        internm2                        interne1
+                        internm1
+        """
+        net.add_lane("inter_nw_3", "internm1",
+                     StraightLane(np.array([99, -202]), np.array([124, -202]), line_types=[c, s]))
+        net.add_lane("inter_nw_3", "internm1",
+                     StraightLane(np.array([99, -198]), np.array([124, -198]), line_types=[s, s]))
+        net.add_lane("inter_nw_3", "internm1",
+                     StraightLane(np.array([99, -194]), np.array([124, -194]), line_types=[s, s]))
+        net.add_lane("inter_nw_3", "internm1",
+                     StraightLane(np.array([99, -190]), np.array([124, -190]), line_types=[s, c]))
+        # net.add_lane("internw_3", "internm1",
+        #              StraightLane(np.array([99, -186]), np.array([124, -186]), line_types=[s, c]))
+
+        net.add_lane("internm1", "internm2",
+                     StraightLane(np.array([124, -202]), np.array([149, -202]), line_types=[c, s]))
+        net.add_lane("internm1", "internm2",
+                     StraightLane(np.array([124, -198]), np.array([149, -198]), line_types=[s, s]))
+        net.add_lane("internm1", "internm2",
+                     StraightLane(np.array([124, -194]), np.array([149, -194]), line_types=[s, s]))
+        net.add_lane("internm1", "internm2",
+                     StraightLane(np.array([124, -190]), np.array([149, -190]), line_types=[s, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([149, -190]), np.array([156, -190]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([155, -190]), np.array([162, -194]), line_types=[n, c]))
+
+        net.add_lane("internm2", "internm3",
+                     StraightLane(np.array([149, -202]), np.array([174, -202]), line_types=[c, s]))
+        net.add_lane("internm2", "internm3",
+                     StraightLane(np.array([149, -198]), np.array([174, -198]), line_types=[s, s]))
+        net.add_lane("internm2", "internm3",
+                     StraightLane(np.array([149, -194]), np.array([174, -194]), line_types=[s, s]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([174, -193]), np.array([176, -189]), line_types=[n, c]))
+
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([197, -190]), np.array([200, -186]), line_types=[n, c]))
+        net.add_lane("internm3", "interne1",
+                     StraightLane(np.array([174, -202]), np.array([199, -202]), line_types=[c, s]))
+        net.add_lane("internm3", "interne1",
+                     StraightLane(np.array([174, -198]), np.array([199, -198]), line_types=[s, s]))
+        net.add_lane("internm3", "interne1",
+                     StraightLane(np.array([174, -194]), np.array([199, -194]), line_types=[s, s]))
+        net.add_lane("internm3", "interne1",
+                     StraightLane(np.array([174, -190]), np.array([199, -190]), line_types=[s, c]))
+
+        net.add_lane("inter_ne_1", "internw3",
+                     StraightLane(np.array([199, -210]), np.array([99, -210]), line_types=[s, c]))
+        net.add_lane("inter_ne_1", "internw3",
+                     StraightLane(np.array([199, -206]), np.array([99, -206]), line_types=[c, s]))
+
+        """
+        crossroad of northeast
+        """
+
+        net.add_lane("interne1", "newel",
+                     StraightLane(np.array([199, -202]), np.array([224, -202]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne1", "neweml",
+                     StraightLane(np.array([199, -198]), np.array([224, -198]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne1", "newem",
+                     StraightLane(np.array([199, -194]), np.array([224, -194]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne1", "newemr",
+                     StraightLane(np.array([199, -190]), np.array([224, -190]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne1", "newer",
+                     StraightLane(np.array([199, -186]), np.array([224, -186]), line_types=[c, c], forbidden=True))
+        net.add_lane("newxr", "inter_ne_1",
+                     StraightLane(np.array([224, -210]), np.array([199, -210]), line_types=[s, c]))
+        net.add_lane("newxl", "inter_ne_1",
+                     StraightLane(np.array([224, -206]), np.array([199, -206]), line_types=[c, s]))
+
+        net.add_lane("nesxr", "inter_ne_2",
+                     StraightLane(np.array([228, -182]), np.array([228, -161]), line_types=[s, c]))
+        net.add_lane("nesxm", "inter_ne_2",
+                     StraightLane(np.array([232, -182]), np.array([232, -161]), line_types=[s, s]))
+        net.add_lane("nesxl", "inter_ne_2",
+                     StraightLane(np.array([236, -182]), np.array([236, -161]), line_types=[c, s]))
+        net.add_lane("interne2", "nesel",
+                     StraightLane(np.array([240, -161]), np.array([240, -182]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne2", "neser",
+                     StraightLane(np.array([244, -161]), np.array([244, -182]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("neexl", "inter_ne_3",
+                     StraightLane(np.array([248, -198]), np.array([273, -198]), line_types=[c, s]))
+        net.add_lane("neexr", "inter_ne_3",
+                     StraightLane(np.array([248, -194]), np.array([273, -194]), line_types=[s, c]))
+        net.add_lane("inter_ne_3", "neex",
+                     StraightLane(np.array([273, -198]), np.array([298, -198]), line_types=[c, s]))
+        net.add_lane("inter_ne_3", "neex",
+                     StraightLane(np.array([273, -194]), np.array([298, -194]), line_types=[s, c]))
+        net.add_lane("interne3", "neeel",
+                     StraightLane(np.array([273, -202]), np.array([248, -202]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne3", "neeer",
+                     StraightLane(np.array([273, -206]), np.array([248, -206]), line_types=[c, c], forbidden=True))
+        net.add_lane("neee", "interne3",
+                     StraightLane(np.array([298, -202]), np.array([273, -202]), line_types=[c, s]))
+        net.add_lane("neee", "interne3",
+                     StraightLane(np.array([298, -206]), np.array([273, -206]), line_types=[s, c]))
+
+        net.add_lane("nene", "interne4",
+                     StraightLane(np.array([228, -261]), np.array([228, -239]), line_types=[s, c]))
+        net.add_lane("nene", "interne4",
+                     StraightLane(np.array([232, -261]), np.array([232, -239]), line_types=[c, s]))
+        net.add_lane("interne4", "nener",
+                     StraightLane(np.array([228, -239]), np.array([228, -214]), line_types=[c, c], forbidden=True))
+        net.add_lane("interne4", "nenel",
+                     StraightLane(np.array([232, -239]), np.array([232, -214]), line_types=[c, c], forbidden=True))
+        net.add_lane("nenxl", "inter_ne_4",
+                     StraightLane(np.array([236, -214]), np.array([236, -239]), line_types=[c, s]))
+        net.add_lane("nenxr", "inter_ne_4",
+                     StraightLane(np.array([240, -214]), np.array([240, -239]), line_types=[s, c]))
+        net.add_lane("inter_ne_4", "nenx",
+                     StraightLane(np.array([236, -239]), np.array([236, -264]), line_types=[c, s]))
+        net.add_lane("inter_ne_4", "nenx",
+                     StraightLane(np.array([240, -239]), np.array([240, -264]), line_types=[s, c]))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        net.add_lane("nener", "newxr",
+                     StraightLane(np.array([228, -214]), np.array([224, -210]), line_types=[n, n], forbidden=True))
+        net.add_lane("nenel", "neexl",
+                     StraightLane(np.array([232, -214]), np.array([248, -198]), line_types=[n, n], forbidden=True))
+        net.add_lane("nenel", "nesxm",
+                     StraightLane(np.array([232, -214]), np.array([232, -182]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("newer", "nesxr",
+                     StraightLane(np.array([224, -186]), np.array([228, -182]), line_types=[n, n], forbidden=True))
+        net.add_lane("newel", "nenxl",
+                     StraightLane(np.array([224, -202]), np.array([236, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("neweml", "nenxl",
+                     StraightLane(np.array([224, -198]), np.array([236, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("newem", "neexl",
+                     StraightLane(np.array([224, -194]), np.array([248, -198]), line_types=[n, n], forbidden=True))
+        net.add_lane("newemr", "neexl",
+                     StraightLane(np.array([224, -190]), np.array([248, -198]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("neser", "neexr",
+                     StraightLane(np.array([244, -182]), np.array([248, -194]), line_types=[n, n], forbidden=True))
+        net.add_lane("nesel", "nenxl",
+                     StraightLane(np.array([240, -182]), np.array([236, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("nesel", "newxl",
+                     StraightLane(np.array([240, -182]), np.array([224, -206]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("neeer", "nenxr",
+                     StraightLane(np.array([248, -206]), np.array([240, -214]), line_types=[n, n], forbidden=True))
+        net.add_lane("neeel", "nesxl",
+                     StraightLane(np.array([248, -202]), np.array([236, -182]), line_types=[n, n], forbidden=True))
+        net.add_lane("neeel", "newxl",
+                     StraightLane(np.array([248, -202]), np.array([224, -206]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of east
+        """
+        net.add_lane("inter_ne_2", "interem4",
+                     StraightLane(np.array([228, -161]), np.array([228, -136]), line_types=[s, c]))
+        net.add_lane("inter_ne_2", "interem4",
+                     StraightLane(np.array([232, -161]), np.array([232, -136]), line_types=[s, s]))
+        net.add_lane("inter_ne_2", "interem4",
+                     StraightLane(np.array([236, -161]), np.array([236, -136]), line_types=[c, s]))
+        net.add_lane("inter_em_4", "interne2",
+                     StraightLane(np.array([240, -136]), np.array([240, -161]), line_types=[c, s]))
+        net.add_lane("inter_em_4", "interne2",
+                     StraightLane(np.array([244, -136]), np.array([244, -161]), line_types=[s, c]))
+
+        """
+        crossroad of east middle
+        """
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([224, -140]), np.array([220, -136]), line_types=[c, n]))
+        net.add_lane("interem4", "emner",
+                     StraightLane(np.array([224, -136]), np.array([224, -111]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem4", "emnemr",
+                     StraightLane(np.array([228, -136]), np.array([228, -111]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem4", "emneml",
+                     StraightLane(np.array([232, -136]), np.array([232, -111]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem4", "emnel",
+                     StraightLane(np.array([236, -136]), np.array([236, -111]), line_types=[c, c], forbidden=True))
+        net.add_lane("emnxl", "inter_em_4",
+                     StraightLane(np.array([240, -111]), np.array([240, -136]), line_types=[c, s]))
+        net.add_lane("emnxr", "inter_em_4",
+                     StraightLane(np.array([244, -111]), np.array([244, -136]), line_types=[s, c]))
+
+        net.add_lane("emsxr", "inter_em_2",
+                     StraightLane(np.array([228, -91]), np.array([228, -66]), line_types=[s, c]))
+        net.add_lane("emsxm", "inter_em_2",
+                     StraightLane(np.array([232, -91]), np.array([232, -66]), line_types=[s, s]))
+        net.add_lane("emsxl", "inter_em_2",
+                     StraightLane(np.array([236, -91]), np.array([236, -66]), line_types=[c, s]))
+        net.add_lane("interem2", "emsel",
+                     StraightLane(np.array([240, -66]), np.array([240, -91]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem2", "emser",
+                     StraightLane(np.array([244, -66]), np.array([244, -91]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("emwxr", "inter_em_1",
+                     StraightLane(np.array([220, -107]), np.array([195, -107]), line_types=[s, c]))
+        net.add_lane("emwxl", "inter_em_1",
+                     StraightLane(np.array([220, -103]), np.array([195, -103]), line_types=[c, s]))
+        net.add_lane("inter_em_1", "emwx",
+                     StraightLane(np.array([195, -107]), np.array([170, -107]), line_types=[s, c]))
+        net.add_lane("inter_em_1", "emwx",
+                     StraightLane(np.array([195, -103]), np.array([170, -103]), line_types=[c, s]))
+        net.add_lane("emwe", "interem1",
+                     StraightLane(np.array([170, -99]), np.array([195, -99]), line_types=[c, s]))
+        net.add_lane("emwe", "interem1",
+                     StraightLane(np.array([170, -95]), np.array([195, -95]), line_types=[s, c]))
+        net.add_lane("interem1", "emwel",
+                     StraightLane(np.array([195, -99]), np.array([220, -99]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem1", "emwer",
+                     StraightLane(np.array([195, -95]), np.array([220, -95]), line_types=[c, c], forbidden=True))
+
+        net.add_lane("emee", "interem3",
+                     StraightLane(np.array([298, -107]), np.array([273, -107]), line_types=[s, c]))
+        net.add_lane("emee", "interem3",
+                     StraightLane(np.array([298, -103]), np.array([273, -103]), line_types=[c, s]))
+        net.add_lane("interem3", "emeer",
+                     StraightLane(np.array([273, -107]), np.array([248, -107]), line_types=[c, c], forbidden=True))
+        net.add_lane("interem3", "emeel",
+                     StraightLane(np.array([273, -103]), np.array([248, -103]), line_types=[c, c], forbidden=True))
+        net.add_lane("emexl", "inter_em_3",
+                     StraightLane(np.array([248, -99]), np.array([273, -99]), line_types=[c, s]))
+        net.add_lane("emexr", "inter_em_3",
+                     StraightLane(np.array([248, -95]), np.array([273, -95]), line_types=[s, c]))
+        net.add_lane("inter_em_3", "emex",
+                     StraightLane(np.array([273, -99]), np.array([298, -99]), line_types=[c, s]))
+        net.add_lane("inter_em_3", "emex",
+                     StraightLane(np.array([273, -95]), np.array([298, -95]), line_types=[s, c]))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        net.add_lane("emner", "emwxr",
+                     StraightLane(np.array([224, -111]), np.array([220, -107]), line_types=[n, n], forbidden=True))
+        net.add_lane("emnemr", "emsxm",
+                     StraightLane(np.array([228, -111]), np.array([232, -91]), line_types=[n, n], forbidden=True))
+        net.add_lane("emneml", "emsxm",
+                     StraightLane(np.array([232, -111]), np.array([232, -91]), line_types=[n, n], forbidden=True))
+        net.add_lane("emnel", "emexl",
+                     StraightLane(np.array([236, -111]), np.array([248, -99]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("emwer", "emsxr",
+                     StraightLane(np.array([220, -95]), np.array([228, -91]), line_types=[n, n], forbidden=True))
+        net.add_lane("emwel", "emnxl",
+                     StraightLane(np.array([220, -99]), np.array([240, -111]), line_types=[n, n], forbidden=True))
+        net.add_lane("emwel", "emexl",
+                     StraightLane(np.array([220, -99]), np.array([248, -99]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("emser", "emexr",
+                     StraightLane(np.array([244, -91]), np.array([248, -95]), line_types=[n, n], forbidden=True))
+        net.add_lane("emsel", "emwxl",
+                     StraightLane(np.array([240, -91]), np.array([220, -103]), line_types=[n, n], forbidden=True))
+        net.add_lane("emsel", "emnxl",
+                     StraightLane(np.array([240, -91]), np.array([240, -111]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("emeer", "emnxr",
+                     StraightLane(np.array([248, -107]), np.array([244, -111]), line_types=[n, n], forbidden=True))
+        net.add_lane("emeel", "emsxl",
+                     StraightLane(np.array([248, -103]), np.array([236, -91]), line_types=[n, n], forbidden=True))
+        net.add_lane("emeel", "emwxl",
+                     StraightLane(np.array([248, -103]), np.array([220, -103]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of east
+        """
+        net.add_lane("inter_em_2", "interse4",
+                     StraightLane(np.array([228, -66]), np.array([228, -41]), line_types=[s, c]))
+        net.add_lane("inter_em_2", "interse4",
+                     StraightLane(np.array([232, -66]), np.array([232, -41]), line_types=[s, s]))
+        net.add_lane("inter_em_2", "interse4",
+                     StraightLane(np.array([236, -66]), np.array([236, -41]), line_types=[c, s]))
+        net.add_lane("inter_se_4", "interem2",
+                     StraightLane(np.array([240, -41]), np.array([240, -66]), line_types=[c, s]))
+        net.add_lane("inter_se_4", "interem2",
+                     StraightLane(np.array([244, -41]), np.array([244, -66]), line_types=[s, c]))
+
+        """
+        crossroad of southeast
+        """
+        net.add_lane("interse4", "sener",
+                     StraightLane(np.array([228, -41]), np.array([228, -16]), line_types=[c, c], forbidden=True))
+        net.add_lane("interse4", "senem",
+                     StraightLane(np.array([232, -41]), np.array([232, -16]), line_types=[c, c], forbidden=True))
+        net.add_lane("interse4", "senel",
+                     StraightLane(np.array([236, -41]), np.array([236, -16]), line_types=[c, c], forbidden=True))
+        net.add_lane("senxl", "inter_se_4",
+                     StraightLane(np.array([240, -16]), np.array([240, -41]), line_types=[c, s]))
+        net.add_lane("senxr", "inter_se_4",
+                     StraightLane(np.array([244, -16]), np.array([244, -41]), line_types=[s, c]))
+
+        net.add_lane("sesxr", "inter_se_2",
+                     StraightLane(np.array([232, 8]), np.array([232, 33]), line_types=[s, c]))
+        net.add_lane("sesxl", "inter_se_2",
+                     StraightLane(np.array([236, 8]), np.array([236, 33]), line_types=[c, s]))
+        net.add_lane("inter_se_2", "sesx",
+                     StraightLane(np.array([232, 33]), np.array([232, 58]), line_types=[s, c]))
+        net.add_lane("inter_se_2", "sesx",
+                     StraightLane(np.array([236, 33]), np.array([236, 58]), line_types=[c, s]))
+        net.add_lane("interse2", "sesel",
+                     StraightLane(np.array([240, 33]), np.array([240, 8]), line_types=[c, c], forbidden=True))
+        net.add_lane("interse2", "seser",
+                     StraightLane(np.array([244, 33]), np.array([244, 8]), line_types=[c, c], forbidden=True))
+        net.add_lane("sese", "interse2",
+                     StraightLane(np.array([240, 58]), np.array([240, 33]), line_types=[c, s]))
+        net.add_lane("sese", "interse2",
+                     StraightLane(np.array([244, 58]), np.array([244, 33]), line_types=[s, c]))
+
+        net.add_lane("interse1", "sewel",
+                     StraightLane(np.array([199, 0]), np.array([224, 0]), line_types=[c, c], forbidden=True))
+        net.add_lane("interse1", "sewer",
+                     StraightLane(np.array([199, 4]), np.array([224, 4]), line_types=[c, c], forbidden=True))
+        net.add_lane("sewxr", "inter_se_1",
+                     StraightLane(np.array([224, -8]), np.array([199, -8]), line_types=[s, c]))
+        net.add_lane("sewxl", "inter_se_1",
+                     StraightLane(np.array([224, -4]), np.array([199, -4]), line_types=[c, s]))
+
+        net.add_lane("seexl", "inter_se_3",
+                     StraightLane(np.array([248, 0]), np.array([273, 0]), line_types=[c, s]))
+        net.add_lane("seexr", "inter_se_3",
+                     StraightLane(np.array([248, 4]), np.array([273, 4]), line_types=[s, c]))
+        net.add_lane("inter_se_3", "seex",
+                     StraightLane(np.array([273, 0]), np.array([298, 0]), line_types=[c, s]))
+        net.add_lane("inter_se_3", "seex",
+                     StraightLane(np.array([273, 4]), np.array([298, 4]), line_types=[s, c]))
+        net.add_lane("seee", "interse3",
+                     StraightLane(np.array([298, -4]), np.array([273, -4]), line_types=[c, s]))
+        net.add_lane("seee", "interse3",
+                     StraightLane(np.array([298, -8]), np.array([273, -8]), line_types=[s, c]))
+        net.add_lane("interse3", "seeel",
+                     StraightLane(np.array([273, -4]), np.array([248, -4]), line_types=[c, c], forbidden=True))
+        net.add_lane("interse3", "seeer",
+                     StraightLane(np.array([273, -8]), np.array([248, -8]), line_types=[c, c], forbidden=True))
+
+        # bellow: fulfill the turning lanes for vehicles to turn
+        net.add_lane("sewer", "sesxr",
+                     StraightLane(np.array([224, 4]), np.array([232, 8]), line_types=[n, n], forbidden=True))
+        net.add_lane("sewel", "senxl",
+                     StraightLane(np.array([224, 0]), np.array([240, -16]), line_types=[n, n], forbidden=True))
+        net.add_lane("sewel", "seexl",
+                     StraightLane(np.array([224, 0]), np.array([248, 0]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("seser", "seexr",
+                     StraightLane(np.array([244, 8]), np.array([248, 4]), line_types=[n, n], forbidden=True))
+        net.add_lane("sesel", "sewxl",
+                     StraightLane(np.array([240, 8]), np.array([224, -4]), line_types=[n, n], forbidden=True))
+        net.add_lane("sesel", "senxl",
+                     StraightLane(np.array([240, 8]), np.array([240, -16]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("seeer", "senxr",
+                     StraightLane(np.array([248, -8]), np.array([244, -16]), line_types=[n, n], forbidden=True))
+        net.add_lane("seeel", "sesxl",
+                     StraightLane(np.array([248, -4]), np.array([236, 8]), line_types=[n, n], forbidden=True))
+        net.add_lane("seeel", "sewxl",
+                     StraightLane(np.array([248, -4]), np.array([224, -4]), line_types=[n, n], forbidden=True))
+
+        net.add_lane("sener", "sewxr",
+                     StraightLane(np.array([228, -16]), np.array([224, -8]), line_types=[n, n], forbidden=True))
+        net.add_lane("senem", "sesxl",
+                     StraightLane(np.array([232, -16]), np.array([236, 8]), line_types=[n, n], forbidden=True))
+        net.add_lane("senel", "seexl",
+                     StraightLane(np.array([236, -16]), np.array([248, 0]), line_types=[n, n], forbidden=True))
+
+        """
+        straight road of south
+        """
+        net.add_lane("inter_sw_3", "inter_sm_1",
+                     StraightLane(np.array([95, 0]), np.array([125, 0]), line_types=[c, s]))
+        net.add_lane("inter_sw_3", "inter_sm_1",
+                     StraightLane(np.array([95, 4]), np.array([125, 4]), line_types=[s, c]))
+        net.add_lane("intersm1", "intersw3",
+                     StraightLane(np.array([125, -4]), np.array([95, -4]), line_types=[c, s]))
+        net.add_lane("intersm1", "intersw3",
+                     StraightLane(np.array([125, -8]), np.array([95, -8]), line_types=[s, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([125, -12]), np.array([120, -12]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([120, -12]), np.array([115, -8]), line_types=[n, c]))
+
+        net.add_lane("inter_sm_1", "inter_sm_2",
+                     StraightLane(np.array([125, 0]), np.array([155, 0]), line_types=[s, s]))
+        net.add_lane("inter_sm_1", "inter_sm_2",
+                     StraightLane(np.array([125, 4]), np.array([155, 4]), line_types=[s, c]))
+        net.add_lane("intersm2", "intersm1",
+                     StraightLane(np.array([155, -4]), np.array([125, -4]), line_types=[c, s]))
+        net.add_lane("intersm2", "intersm1",
+                     StraightLane(np.array([155, -8]), np.array([125, -8]), line_types=[s, s]))
+        net.add_lane("intersm2", "intersm1",
+                     StraightLane(np.array([155, -12]), np.array([125, -12]), line_types=[s, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([155, -8]), np.array([152, -12]), line_types=[n, c]))
+
+        net.add_lane("inter_sm_2", "inter_sm_3",
+                     StraightLane(np.array([155, 0]), np.array([170, 0]), line_types=[s, s]))
+        net.add_lane("inter_sm_2", "inter_sm_3",
+                     StraightLane(np.array([155, 4]), np.array([170, 4]), line_types=[s, c]))
+        net.add_lane("intersm3", "intersm2",
+                     StraightLane(np.array([170, -4]), np.array([155, -4]), line_types=[c, s]))
+        net.add_lane("intersm3", "intersm2",
+                     StraightLane(np.array([170, -8]), np.array([155, -8]), line_types=[s, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([170, -12]), np.array([165, -12]), line_types=[n, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([165, -12]), np.array([160, -8]), line_types=[n, c]))
+
+        net.add_lane("inter_sm_3", "interse1",
+                     StraightLane(np.array([170, 0]), np.array([199, 0]), line_types=[s, s]))
+        net.add_lane("inter_sm_3", "interse1",
+                     StraightLane(np.array([170, 4]), np.array([199, 4]), line_types=[s, c]))
+        net.add_lane(" ", " ",
+                     StraightLane(np.array([199, -8]), np.array([195, -12]), line_types=[n, c]))
+        net.add_lane("inter_se_1", "intersm3",
+                     StraightLane(np.array([199, -4]), np.array([170, -4]), line_types=[c, s]))
+        net.add_lane("inter_se_1", "intersm3",
+                     StraightLane(np.array([199, -8]), np.array([170, -8]), line_types=[s, s]))
+        net.add_lane("inter_se_1", "intersm3",
+                     StraightLane(np.array([199, -12]), np.array([170, -12]), line_types=[s, c]))
+
+        road = Road(network=net, np_random=self.np_random)
+
+        green_time = 5
+        red_time = 8
+        green_flash_time = 2
+        yellow_time = 1
+        """
+        southwest crossroad traffic lights
+        """
+        self.traffic_lights["red_sw"] = [
+            RedLight(road, [50, 0], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [50, 4], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [54, -12], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [58, -12], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [70, -8], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [70, -4], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [66, 8], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [62, 8], red_time, green_time, green_flash_time, yellow_time, 0),
+        ]
+
+        """
+        west middle crossroad traffic lights
+        """
+
+        self.traffic_lights["red_wm"] = [
+            RedLight(road, [50, -99], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [50, -95], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [54, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [58, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [70, -107], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [70, -103], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [66, -87], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [62, -87], red_time, green_time, green_flash_time, yellow_time, 0)
+        ]
+
+        """
+        northwest crossroad traffic light
+        """
+
+        self.traffic_lights["red_nw"] = [
+            RedLight(road, [50, -198], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [50, -194], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [54, -214], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [58, -214], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [74, -206], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [74, -210], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [66, -186], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [62, -186], red_time, green_time, green_flash_time, yellow_time, 0)
+        ]
+
+        """
+        northeast crossroad traffic light
+        """
+
+        self.traffic_lights["red_ne"] = [
+            RedLight(road, [224, -186], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, -190], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, -194], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, -198], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, -202], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -206], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -202], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [228, -214], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [232, -214], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [244, -182], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [240, -182], red_time, green_time, green_flash_time, yellow_time, 0)
+        ]
+
+        """
+        east middle crossroad traffic light
+        """
+
+        self.traffic_lights["red_em"] = [
+            RedLight(road, [220, -95], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [220, -99], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -107], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -103], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [228, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [232, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [236, -111], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [244, -91], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [240, -91], red_time, green_time, green_flash_time, yellow_time, 0)
+        ]
+
+        """
+        southeast crossroad traffic light
+        """
+
+        self.traffic_lights["red_se"] = [
+            RedLight(road, [224, 0], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [224, 4], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -8], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [248, -4], red_time, green_time, green_flash_time, yellow_time, 1),
+            RedLight(road, [228, -16], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [232, -16], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [236, -16], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [244, 8], red_time, green_time, green_flash_time, yellow_time, 0),
+            RedLight(road, [240, 8], red_time, green_time, green_flash_time, yellow_time, 0)
+        ]
+
+        self.road = road
+
+        for lane_index in road.network.LANES:
+            _from, _to, _id = lane_index
+            _before = None
+            next_to = None
+            lane = self.road.network.get_lane(lane_index)
+            try:
+                next_to = list(self.road.network.graph[_to].keys())[
+                    np.random.randint(len(self.road.network.graph[_to]))]
+                if len(self.road.network.graph[_from][_to]) <= len(self.road.network.graph[_to][next_to]):
+                    next_id = _id
+                else:
+                    if _id + 1 > len(self.road.network.graph[_to][next_to]):
+                        next_id = len(self.road.network.graph[_to][next_to]) - 1
+                    else:
+                        next_id = _id
+                if (_to, next_to, next_id) in self.road.network.LANES:
+                    lane.after_lane.append((_to, next_to, next_id))
+            except KeyError:
+                pass
+            try:
+                for _key in (list(self.road.network.graph.keys())):
+                    if _from in list(self.road.network.graph[_key].keys()):
+                        _before = _key
+                        break
+
+                if _before:
+                    if len(self.road.network.graph[_before][_from]) < len(self.road.network.graph[_from][_to]):
+                        if _id <= len(self.road.network.graph[_before][_from]) - 1:
+                            before_id = _id
+                        else:
+                            before_id = len(self.road.network.graph[_before][_from]) - 1
+                    else:
+                        before_id = _id
+                    if (_before, _from, before_id) in self.road.network.LANES:
+                        lane.before_lane.append((_before, _from, before_id))
+            except KeyError:
+                pass
+
+    def make_vehicles(self):
+        """
+            Populate a road with several vehicles on the highway and on the merging lane, as well as an ego-vehicle.
+        :return: the ego-vehicle
+        """
+        road = self.road
+
+        ego_lane = self.road.network.get_lane(("intersm1", "intersw3", 1))
+        position = ego_lane.position(0, -1)
+        ego_vehicle = IDMVehicle(self.road,
+                                 position,
+                                 velocity=10,
+                                 heading=ego_lane.heading_at(position)).plan_route_to("intersm2")
+        ego_vehicle.id = 0
+        ego_vehicle.myimage = pygame.image.load("../red_alpha_resize.png")
+        road.vehicles.append(ego_vehicle)
+        self.vehicle = ego_vehicle
+
+    def fake_step(self):
+        """
+        :return:
+        """
+        self.vehicle.lanes_around = []
+        active_vehicles = 0
+
+        flag = 1
+        while flag:
+            for i in range(len(self.road.vehicles)):
+                if i == len(self.road.vehicles) - 1:
+                    flag = 0
+                if hasattr(self.road.vehicles[i], "state"):
+                    continue
+                else:
+                    if self.road.vehicles[i].lane_index[1][-1] == "x":
+                        self.road.vehicles.remove(self.road.vehicles[i])
+                        break
+                    else:
+                        active_vehicles += 1
+
+        for i in self.road.network.LANES:
+            l = self.road.network.get_lane(i)
+            l_middle = (l.end - l.start) / 2 + l.start
+            if np.linalg.norm(l_middle - self.vehicle.position) < 100:
+                self.vehicle.lanes_around.append(i)
+
+        self.get_traffic_lights()
+
+        for k in range(int(self.SIMULATION_FREQUENCY // self.POLICY_FREQUENCY)):
+            self.road.act()
+            self.road.step(1 / self.SIMULATION_FREQUENCY)
+
+            # Automatically render intermediate simulation steps if a viewer has been launched
+            self._automatic_rendering()
+
+            # Stop at terminal states
+            if self.done or self._is_terminal():
+                break
+
+        self.enable_auto_render = False
+        self.steps += 1
+        # from highway_env.extractors import Extractor
+        # extractor = Extractor()
+        # extractor_features = extractor.FeatureExtractor(self.road.vehicles, 0, 1)
+
+        birth_place = self.vehicle.lanes_around
+        flag = 1
+        while flag:
+            for i in range(len(birth_place)):
+                if i == len(birth_place) - 1:
+                    flag = 0
+                if birth_place[i][0] in self.entrance or birth_place[i][1] in self.end:
+                    continue
+                if birth_place[i][1].find("inter") == -1:
+                    birth_place.remove(birth_place[i])
+                    break
+        pre_birth = None
+        for i in range(5):
+            try:
+                velocity_deviation = 1.0
+                velocity = 5 + np.random.randint(1, 5) * velocity_deviation
+                other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+
+                birth = birth_place[np.random.randint(0, len(birth_place))]
+                lane = self.road.network.get_lane(birth)
+                if pre_birth != birth and active_vehicles <= 10 and np.linalg.norm(
+                        lane.start - self.vehicle.position) >= self.vehicle.LENGTH + self.vehicle.DISTANCE_WANTED + self.vehicle.TIME_WANTED * velocity:
+                    car = other_vehicles_type.make_on_lane(self.road, birth,
+                                                           longitudinal=0,
+                                                           velocity=velocity)
+                    if self.config["incoming_vehicle_destination"] is not None:
+                        destination = self.end[self.config["incoming_vehicle_destination"]]
+                    else:
+                        destination = self.end[np.random.randint(0, len(self.end))]
+                    # car.plan_route_to(destination)
+                    # car.randomize_behavior()
+                    self.road.vehicles.append(car)
+                    lane.vehicles.append(car)
+                    pre_birth = birth
+            except:
+                pass
+        # obs = self._observation()
+        # reward = self._reward(action)
+        terminal = self._is_terminal()
+        # info = {}
+        return terminal  # , extractor_features
+
+    def get_traffic_lights(self):
+        if self.have_traffic_lights:
+            # print("have traffic lights")
+            if self.vehicle.lane_index[1].find("_") != -1:
+                flag = 1
+                while flag:
+                    for i in range(len(self.road.vehicles)):
+                        # print("i:",i)
+                        if i == len(self.road.vehicles) - 1:
+                            flag = 0
+                        if hasattr(self.road.vehicles[i], "state"):
+                            self.road.vehicles.remove(self.road.vehicles[i])
+                            break
+                self.have_traffic_lights = False
+        else:
+            # print("no traffic lights")
+            if self.vehicle.lane_index[1].find("intersw") != -1:
+                for _red in self.traffic_lights["red_sw"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            elif self.vehicle.lane_index[1].find("interwm") != -1:
+                for _red in self.traffic_lights["red_wm"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            elif self.vehicle.lane_index[1].find("internw") != -1:
+                for _red in self.traffic_lights["red_nw"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            elif self.vehicle.lane_index[1].find("interne") != -1:
+                for _red in self.traffic_lights["red_ne"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            elif self.vehicle.lane_index[1].find("interem") != -1:
+                for _red in self.traffic_lights["red_em"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            elif self.vehicle.lane_index[1].find("interse") != -1:
+                for _red in self.traffic_lights["red_se"]:
+                    self.road.vehicles.append(_red)
+                self.have_traffic_lights = True
+            else:
+                pass
+
+
+if __name__ == '__main__':
+    pass

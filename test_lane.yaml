@@ -1,0 +1,5 @@
+StraightLane:
+  origin: [0,0]
+  heading: 0
+  width: 4
+  line_types: [3,0]
